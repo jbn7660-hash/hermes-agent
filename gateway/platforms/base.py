@@ -1195,7 +1195,7 @@ def resolve_channel_prompt(
     if not isinstance(prompts, dict):
         return None
 
-    for key in (channel_id, parent_id):
+    for key in (channel_id, parent_id, "*", "default"):
         if not key:
             continue
         prompt = prompts.get(key)
