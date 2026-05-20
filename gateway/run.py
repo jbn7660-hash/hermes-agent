@@ -64,7 +64,11 @@ _AGENT_CACHE_MAX_SIZE = 128
 _AGENT_CACHE_IDLE_TTL_SECS = 3600.0  # evict agents idle for >1h
 _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
 _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
-_TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
+
+# _telegramize_command_mentions + _TELEGRAM_COMMAND_MENTION_RE have moved to
+# gateway/_helpers/text.py.  They are re-exported at the bottom of this file
+# so existing `from gateway.run import …` consumers keep working.
+from gateway._helpers.text import _TELEGRAM_COMMAND_MENTION_RE, _telegramize_command_mentions  # noqa: E402,F401
 
 _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"("  # transient/auxiliary status that should stay in logs, not Telegram chat
@@ -238,24 +242,7 @@ def _prepare_gateway_status_message(platform: Any, event_type: str, message: str
     return text
 
 
-def _telegramize_command_mentions(text: str, platform: Any) -> str:
-    """Rewrite slash-command mentions to Telegram-valid command names.
-
-    Telegram Bot API command names allow only lowercase letters, digits, and
-    underscores.  Keep other platform renderings unchanged, but normalize
-    Telegram help text so command mentions remain clickable/valid there.
-    """
-    platform_value = getattr(platform, "value", platform)
-    if platform_value != "telegram":
-        return text
-
-    from hermes_cli.commands import _sanitize_telegram_name
-
-    def _replace(match: re.Match[str]) -> str:
-        sanitized = _sanitize_telegram_name(match.group(1))
-        return f"/{sanitized}" if sanitized else match.group(0)
-
-    return _TELEGRAM_COMMAND_MENTION_RE.sub(_replace, text)
+# _telegramize_command_mentions: see gateway/_helpers/text.py (imported above).
 
 
 # Only auto-continue interrupted gateway turns while the interruption is fresh.
