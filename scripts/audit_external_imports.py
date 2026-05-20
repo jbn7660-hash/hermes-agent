@@ -134,7 +134,7 @@ def _walk_py_files(repo_root: Path, scope: str) -> Iterator[Path]:
 def _import_statements(path: Path) -> Iterator[Tuple[int, ast.AST]]:
     """Yield ``(lineno, node)`` for every Import/ImportFrom in ``path``."""
     try:
-        source = path.read_text()
+        source = path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
         return
     try:

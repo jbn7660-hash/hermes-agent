@@ -479,7 +479,7 @@ def _qualified_name(func: ast.AST) -> str:
 
 def _audit_file(path: Path) -> Iterator[Tuple[str, str, str, int]]:
     """Yield ``(file, function, unbound_name, line)`` tuples for one file."""
-    source = path.read_text()
+    source = path.read_text(encoding="utf-8")
     tree = ast.parse(source, filename=str(path))
     module_allowed, _module_suspect = _collect_module_bindings(tree)
     stdlib_in_use = _stdlib_imports_in_module(tree)

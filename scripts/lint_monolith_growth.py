@@ -45,7 +45,7 @@ BASELINE_REL = "scripts/.monolith_baseline.json"
 
 def _count_top_level_defs(path: Path) -> Tuple[int, int]:
     """Return ``(top_level_functions, top_level_classes)`` for one file."""
-    tree = ast.parse(path.read_text(), filename=str(path))
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     funcs = 0
     classes = 0
     for stmt in tree.body:
@@ -74,7 +74,7 @@ def _load_baseline(baseline_path: Path) -> Dict[str, Dict[str, int]]:
     if not baseline_path.exists():
         return {}
     try:
-        return json.loads(baseline_path.read_text())
+        return json.loads(baseline_path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
         print(f"error: malformed baseline {baseline_path}: {exc}", file=sys.stderr)
         sys.exit(2)
@@ -83,7 +83,7 @@ def _load_baseline(baseline_path: Path) -> Dict[str, Dict[str, int]]:
 def _save_baseline(baseline_path: Path, data: Dict[str, Dict[str, int]]) -> None:
     # Sort keys so the file is review-friendly.
     serialised = json.dumps(data, indent=2, sort_keys=True) + "\n"
-    baseline_path.write_text(serialised)
+    baseline_path.write_text(serialised, encoding="utf-8")
 
 
 def main(argv: Iterable[str]) -> int:
