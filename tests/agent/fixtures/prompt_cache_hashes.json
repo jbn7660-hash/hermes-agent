@@ -1,0 +1,21 @@
+{
+  "fixed_now_iso": "2026-01-01T12:00:00+00:00",
+  "messages": [
+    {
+      "role": "system",
+      "sha256": "d5e76f631b4c7da966445ed90376132526c16a85a5f03d40d9d7aa3ba0cdf4f0"
+    },
+    {
+      "role": "user",
+      "sha256": "8c1ec0a1edfcb51cf0274d98db3a78b22b202770c157fce676925c6e32591719"
+    },
+    {
+      "role": "assistant",
+      "sha256": "f5fd6d0a7b8547bb67e2c5f814f380477108e24abc9d2ca9b8a5d8399505cfb4"
+    },
+    {
+      "role": "tool",
+      "sha256": "825a029c70180103c2ce5cfd617c4d979d38cc554c97ee420391cd13fc7b9359"
+    }
+  ]
+}
