@@ -773,6 +773,15 @@ DEFAULT_CONFIG = {
                                       # system prompt + rolling summary + recent tail.
     },
 
+    "context_rollover": {
+        "enabled": False,             # when true, nudge large sessions to delegate long work to a fresh child
+        "warn_threshold": 0.30,       # reserved for status/UI warnings
+        "rollover_threshold": 0.40,   # inject fresh-session handoff at this context usage ratio
+        "hard_threshold": 0.60,       # reserved for future force-rollover policies
+        "mode": "fresh_subagent",    # fresh_subagent | compress_only
+        "max_handoff_messages": 12,   # recent transcript tail included in handoff prompt
+    },
+
     # Anthropic prompt caching (Claude via OpenRouter or native Anthropic API).
     # cache_ttl must be "5m" or "1h" (Anthropic-supported tiers); other values are ignored.
     "prompt_caching": {

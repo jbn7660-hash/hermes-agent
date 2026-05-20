@@ -607,6 +607,14 @@ compression:
   protect_last_n: 20                                # Min recent messages to keep uncompressed
   hygiene_hard_message_limit: 400                   # Gateway safety valve — see below
 
+context_rollover:
+  enabled: false                                    # Nudge large sessions to delegate long work to a fresh child
+  warn_threshold: 0.30                              # Reserved for status/UI warnings
+  rollover_threshold: 0.40                          # Build fresh-session handoff at this context usage ratio
+  hard_threshold: 0.60                              # Reserved for future force-rollover policies
+  mode: fresh_subagent                              # fresh_subagent | compress_only
+  max_handoff_messages: 12                          # Recent transcript tail included in handoff prompt
+
 # The summarization model/provider is configured under auxiliary:
 auxiliary:
   compression:
@@ -620,6 +628,8 @@ Older configs with `compression.summary_model`, `compression.summary_provider`, 
 :::
 
 `hygiene_hard_message_limit` is a gateway-only **pre-compression safety valve**. Runaway sessions with thousands of messages can hit model context limits before the normal percent-of-context threshold fires; when message count crosses this ceiling, Hermes forces compression regardless of token usage. Default `400` — raise it for platforms where very long sessions are normal, lower it to force more aggressive compression. Editing this value on a running gateway takes effect on the next message (see below).
+
+`context_rollover` is a proactive quality-preservation layer for large sessions. When enabled and a substantial request arrives after `rollover_threshold`, Hermes injects a temporary handoff nudge telling the parent agent to use `delegate_task` for fresh-context work. Short conversational replies are skipped, the synthetic handoff is not persisted into session history, and upstream defaults keep the feature disabled unless explicitly configured.
 
 :::tip Gateway hot-reload of compression and context length
 As of recent releases, editing `model.context_length` or any `compression.*` key in `config.yaml` on a running gateway takes effect on the next message — no gateway restart, no `/reset`, no session rotation required. The cached-agent signature includes these keys, so the gateway transparently rebuilds the agent when it sees a change. API keys and tool/skill config still require the usual reload paths.

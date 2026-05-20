@@ -2530,6 +2530,57 @@ class TestRunConversation:
         assert result["final_response"] == "Final answer"
         assert result["completed"] is True
 
+    def test_context_rollover_forces_fresh_subagent_for_large_long_task(self, agent):
+        from agent.context_rollover import ContextRolloverConfig
+
+        self._setup_agent(agent)
+        agent.valid_tool_names.add("delegate_task")
+        agent.context_rollover_config = ContextRolloverConfig.from_mapping({"enabled": True})
+        agent.context_compressor.context_length = 100_000
+        agent.context_compressor.last_prompt_tokens = 45_000
+        delegate_payload = '{"results":[{"status":"success","summary":"Delegated result"}]}'
+
+        with (
+            patch.object(agent, "_dispatch_delegate_task", return_value=delegate_payload) as mock_delegate,
+            patch.object(agent, "_persist_session") as mock_persist,
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("fix the build and run tests")
+
+        assert result["final_response"] == "Delegated result"
+        assert result["turn_exit_reason"] == "context_rollover_delegate"
+        assert result["api_calls"] == 0
+        agent.client.chat.completions.create.assert_not_called()
+        delegate_args = mock_delegate.call_args.args[0]
+        assert delegate_args["goal"] == "fix the build and run tests"
+        assert "CONTEXT ROLLOVER HANDOFF" in delegate_args["context"]
+        assert "delegate_task" in delegate_args["context"]
+        persisted_messages = mock_persist.call_args.args[0]
+        assert persisted_messages[-1] == {"role": "assistant", "content": "Delegated result"}
+
+    def test_context_rollover_skips_short_reply_even_when_large(self, agent):
+        from agent.context_rollover import ContextRolloverConfig
+
+        self._setup_agent(agent)
+        agent.valid_tool_names.add("delegate_task")
+        agent.context_rollover_config = ContextRolloverConfig.from_mapping({"enabled": True})
+        agent.context_compressor.context_length = 100_000
+        agent.context_compressor.last_prompt_tokens = 45_000
+        resp = _mock_response(content="You're welcome", finish_reason="stop")
+        agent.client.chat.completions.create.return_value = resp
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("thanks")
+
+        assert result["final_response"] == "You're welcome"
+        sent_messages = agent.client.chat.completions.create.call_args.kwargs["messages"]
+        assert all("CONTEXT ROLLOVER HANDOFF" not in (m.get("content") or "") for m in sent_messages)
+
     def test_tool_calls_then_stop(self, agent):
         self._setup_agent(agent)
         tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")

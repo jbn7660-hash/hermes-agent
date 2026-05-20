@@ -763,6 +763,104 @@ class ContextCompressor(ContextEngine):
 
         return "\n\n".join(parts)
 
+    def _build_extractive_fallback_summary(
+        self,
+        turns_to_summarize: List[Dict[str, Any]],
+        *,
+        dropped_count: int,
+        error_text: str,
+    ) -> str:
+        """Build a deterministic summary when the LLM summarizer is unavailable.
+
+        This is deliberately extractive rather than clever: preserve the most
+        recent user requests, assistant/tool actions, file paths, and command
+        snippets so compression failure degrades to a usable checkpoint instead
+        of a bare "context was lost" marker.  It never calls an LLM, so it works
+        during provider timeouts and keeps gateway turns moving.
+        """
+        serialized = self._serialize_for_summary(turns_to_summarize)
+        lines = [line.strip() for line in serialized.splitlines() if line.strip()]
+
+        latest_user = "None."
+        completed: list[str] = []
+        relevant_files: list[str] = []
+        critical: list[str] = []
+        file_pattern = re.compile(r"(?:(?:/|\./|~/)[\w.\-()/]+|[\w.\-()/]+\.(?:py|ts|tsx|js|jsx|json|ya?ml|md|toml|sh|txt))")
+        command_pattern = re.compile(r"`([^`]{3,160})`")
+
+        for line in lines:
+            if line.startswith("[USER]:"):
+                latest_user = line[len("[USER]:"):].strip() or latest_user
+            if line.startswith(("[ASSISTANT]:", "[TOOL RESULT")):
+                text = line
+                if len(text) > 280:
+                    text = text[:277].rstrip() + "..."
+                if text not in completed:
+                    completed.append(text)
+            for match in file_pattern.findall(line):
+                if match not in relevant_files:
+                    relevant_files.append(match)
+            for match in command_pattern.findall(line):
+                item = f"Command seen: `{match}`"
+                if item not in critical:
+                    critical.append(item)
+
+        recent_lines = lines[-12:]
+        recent = []
+        for line in recent_lines:
+            if len(line) > 320:
+                line = line[:317].rstrip() + "..."
+            recent.append(f"- {line}")
+
+        completed_block = "\n".join(
+            f"{idx}. {item}" for idx, item in enumerate(completed[-12:], start=1)
+        ) or "None captured."
+        files_block = "\n".join(f"- {item}" for item in relevant_files[:30]) or "None captured."
+        critical_block = "\n".join(f"- {item}" for item in critical[:20]) or "None captured."
+        recent_block = "\n".join(recent) or "- No recoverable text captured."
+
+        return self._with_summary_prefix(redact_sensitive_text(f"""## Active Task
+{latest_user}
+
+## Goal
+Continue the latest user request using the remaining live transcript and current filesystem/state. This checkpoint was generated locally because the LLM compression summarizer failed.
+
+## Constraints & Preferences
+Preserve user preferences from the system prompt and persistent memory. Treat this extractive summary as incomplete but authoritative for the dropped turns it quotes.
+
+## Completed Actions
+{completed_block}
+
+## Active State
+Compression fallback used after dropping {dropped_count} message(s). Summarizer error: {error_text or 'unknown'}.
+
+## In Progress
+Resume from the latest user request and the recent live tail after this summary.
+
+## Blocked
+LLM context summary generation failed; Hermes used deterministic extractive fallback instead of a bare context-loss marker.
+
+## Key Decisions
+None inferred by fallback summarizer.
+
+## Resolved Questions
+Unknown — fallback summarizer preserves excerpts only.
+
+## Pending User Asks
+{latest_user}
+
+## Relevant Files
+{files_block}
+
+## Remaining Work
+Inspect current repository/session state as needed, then continue without relying on dropped raw turns.
+
+## Critical Context
+{critical_block}
+
+## Recent Dropped-Turn Excerpts
+{recent_block}"""))
+
     def _fallback_to_main_for_compression(self, e: Exception, reason: str) -> None:
         """Switch from a separate ``summary_model`` back to the main model.
 
@@ -1494,12 +1592,11 @@ The user has requested that this compaction PRIORITISE preserving all informatio
             n_dropped = compress_end - compress_start
             self._last_summary_dropped_count = n_dropped
             self._last_summary_fallback_used = True
-            summary = (
-                f"{SUMMARY_PREFIX}\n"
-                f"Summary generation was unavailable. {n_dropped} message(s) were "
-                f"removed to free context space but could not be summarized. The removed "
-                f"messages contained earlier work in this session. Continue based on the "
-                f"recent messages below and the current state of any files or resources."
+            err_text = getattr(self, "_last_summary_error", None) or "unknown error"
+            summary = self._build_extractive_fallback_summary(
+                turns_to_summarize,
+                dropped_count=n_dropped,
+                error_text=err_text,
             )
 
         _merge_summary_into_tail = False

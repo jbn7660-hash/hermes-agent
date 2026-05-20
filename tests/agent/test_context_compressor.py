@@ -727,9 +727,9 @@ class TestSummaryFailureTrackingForGatewayWarning:
         msgs = [
             {"role": "system", "content": "sys"},
             {"role": "user", "content": "msg 1"},
-            {"role": "assistant", "content": "msg 2"},
-            {"role": "user", "content": "msg 3"},
-            {"role": "assistant", "content": "msg 4"},
+            {"role": "assistant", "content": "read `pytest tests/agent/test_context_compressor.py -q`"},
+            {"role": "tool", "content": "edited agent/context_compressor.py successfully"},
+            {"role": "user", "content": "please inspect agent/context_compressor.py and run `pytest tests/agent/test_context_compressor.py -q`"},
             {"role": "user", "content": "msg 5"},
             {"role": "assistant", "content": "msg 6"},
             {"role": "user", "content": "msg 7"},
@@ -743,11 +743,14 @@ class TestSummaryFailureTrackingForGatewayWarning:
         assert c._last_summary_fallback_used is True
         assert c._last_summary_dropped_count > 0
         assert c._last_summary_error is not None
-        # Result must still be well-formed (fallback summary present).
-        assert any(
-            isinstance(m.get("content"), str) and "Summary generation was unavailable" in m["content"]
-            for m in result
-        )
+        # Result must still be well-formed (extractive fallback summary present).
+        summaries = [
+            m.get("content", "") for m in result
+            if isinstance(m.get("content"), str) and "Compression fallback used" in m["content"]
+        ]
+        assert summaries
+        assert "agent/context_compressor.py" in summaries[0]
+        assert "pytest tests/agent/test_context_compressor.py -q" in summaries[0]
 
     def test_compress_clears_fallback_flag_on_subsequent_success(self):
         mock_response = MagicMock()
