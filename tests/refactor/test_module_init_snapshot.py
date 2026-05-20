@@ -31,6 +31,11 @@ MONOLITHS = [
     ("gateway.run", "gateway_run"),
     ("cli", "cli"),
     ("hermes_cli.main", "hermes_cli_main"),
+    # Upstream extracted these out of run_agent.py on 2026-05-16; snapshot
+    # them too so any future re-organization is caught (per Codex v2 P1-2).
+    ("agent.agent_init", "agent_agent_init"),
+    ("agent.conversation_loop", "agent_conversation_loop"),
+    ("agent.agent_runtime_helpers", "agent_agent_runtime_helpers"),
 ]
 
 # Environment-variable prefixes / names we care about. Anything not in
