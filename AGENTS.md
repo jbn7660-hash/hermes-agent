@@ -10,20 +10,29 @@ Instructions for AI coding assistants and developers working on the hermes-agent
 
 ## ⚠️ Critical context guards (NEVER violate)
 
-1. **NEVER full-read these god-class entry points.** Each one would consume
-   60–82% of GPT-5.5's 256k context window alone:
+1. **NEVER full-read these god-class entry points.** Each consumes
+   65–89% of GPT-5.5's 256k context window alone:
 
    | File | LOC | Why |
    |---|---|---|
-   | `run_agent.py` | ~16,500 | `AIAgent` class L1113-16322 |
-   | `gateway/run.py` | ~17,100 | `GatewayRunner` class L1175-16598 |
-   | `cli.py` | ~14,200 | `HermesCLI` orchestrator |
-   | `hermes_cli/main.py` | ~12,400 | argparse + CLI bootstrap |
+   | `gateway/run.py` | ~18,200 | `GatewayRunner` class — not yet split |
+   | `cli.py` | ~14,500 | `HermesCLI` orchestrator — not yet split |
+   | `hermes_cli/main.py` | ~13,200 | argparse + CLI bootstrap — not yet split |
 
    Workflow instead: `grep -n "def <method>"` → `Read offset=<line> limit=80`.
    Same rule for `hermes_cli/auth.py`, `tui_gateway/server.py`,
    `hermes_cli/config.py`, `hermes_cli/gateway.py`,
    `agent/auxiliary_client.py` (all > 200 KB).
+
+   **Already split (upstream, May 2026)**: `run_agent.py` is now ~4,100 LOC
+   (normal). `AIAgent.__init__` lives in `agent/agent_init.py` (~1,500 LOC),
+   `run_conversation` in `agent/conversation_loop.py` (~4,100 LOC), and
+   ten runtime helpers in `agent/agent_runtime_helpers.py` (~2,200 LOC).
+   Chat-completion specifics in `agent/chat_completion_helpers.py`,
+   compression in `agent/conversation_compression.py`,
+   Codex Responses adapter in `agent/codex_runtime.py`,
+   `IterationBudget` in `agent/iteration_budget.py`. Read these individually
+   — none exceeds 25% of the context window.
 
 2. **Planning / spec docs MUST be split.** Never write a single planning
    markdown over ~10 KB. Use the index-file pattern:
@@ -47,7 +56,14 @@ Instructions for AI coding assistants and developers working on the hermes-agent
 
 | Concern | File | Notes |
 |---|---|---|
-| Agent loop core | `run_agent.py` | `AIAgent` class — **slice, don't full-read** |
+| Agent class shell | `run_agent.py` | `AIAgent` class core (~4,100 LOC, OK to full-read) |
+| Agent __init__ | `agent/agent_init.py` | extracted constructor (~1,500 LOC) |
+| Agent loop | `agent/conversation_loop.py` | `run_conversation` (~4,100 LOC) |
+| Agent runtime helpers | `agent/agent_runtime_helpers.py` | 10 helpers ported out of run_agent.py |
+| Chat-completion specifics | `agent/chat_completion_helpers.py` | per-provider chat call helpers |
+| Conversation compression | `agent/conversation_compression.py` | summarize-and-trim path |
+| Codex Responses adapter | `agent/codex_runtime.py` | OpenAI Codex Responses API path |
+| Iteration budget | `agent/iteration_budget.py` | shared with subagents |
 | CLI orchestrator | `cli.py` | `HermesCLI` class — **slice, don't full-read** |
 | Gateway runtime | `gateway/run.py` | `GatewayRunner` class — **slice, don't full-read** |
 | CLI subcommands + main | `hermes_cli/main.py` | argparse, profile override — **slice** |

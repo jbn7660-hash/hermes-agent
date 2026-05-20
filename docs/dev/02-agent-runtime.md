@@ -1,11 +1,27 @@
-# AIAgent Runtime — `run_agent.py`
+# AIAgent Runtime — `run_agent.py` + `agent/*`
 
-> ⚠️ `run_agent.py` is ~16,500 LOC. **Never full-read it.** Use
-> `grep -n "def <method>"` then `Read offset=<line> limit=80`.
+> **Post-split (upstream May 2026).** `run_agent.py` is now ~4,100 LOC and
+> safe to full-read. The AIAgent class body still lives there at line ~326,
+> but its `__init__`, `run_conversation`, and most helpers have been
+> extracted into the `agent/` package:
+>
+> | Module | LOC | Role |
+> |---|---|---|
+> | `run_agent.py` | ~4,100 | `AIAgent` class shell + `main()` |
+> | `agent/agent_init.py` | ~1,500 | constructor body (`__init__`, ~60 params) |
+> | `agent/conversation_loop.py` | ~4,100 | `run_conversation` + loop body |
+> | `agent/agent_runtime_helpers.py` | ~2,200 | 10 runtime helpers ported out |
+> | `agent/chat_completion_helpers.py` | ~2,100 | per-provider chat call helpers |
+> | `agent/conversation_compression.py` | ~600 | summarize-and-trim path |
+> | `agent/codex_runtime.py` | ~450 | OpenAI Codex Responses adapter |
+> | `agent/iteration_budget.py` | ~60 | `IterationBudget` (shared with subagents) |
+>
+> Read whichever single module matches your concern. None exceeds 25% of
+> a 256k context window.
 
 The real `AIAgent.__init__` takes ~60 parameters (credentials, routing, callbacks,
 session context, budget, credential pool, etc.). The signature below is the
-minimum subset you'll usually touch — read `run_agent.py` for the full list.
+minimum subset you'll usually touch — read `agent/agent_init.py` for the full list.
 
 ```python
 class AIAgent:
@@ -39,7 +55,8 @@ class AIAgent:
 
 ## Agent Loop
 
-The core loop is inside `run_conversation()` — entirely synchronous, with
+The core loop lives in `agent/conversation_loop.py::run_conversation()` (called
+through `AIAgent.run_conversation` on `run_agent.py`). Synchronous, with
 interrupt checks, budget tracking, and a one-turn grace call:
 
 ```python
