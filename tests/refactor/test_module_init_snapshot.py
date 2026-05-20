@@ -131,6 +131,42 @@ def _filter_in_repo(modules: list[str], repo_root: Path) -> list[str]:
     return keep
 
 
+# Platform-specific / version-specific module names that may or may not
+# appear depending on the host OS, Python build, and transitive dep
+# version. These would otherwise cause a baseline captured on macOS to
+# fail on linux CI (and vice versa). The snapshot test cares about hermes
+# code's own import side effects, not stdlib / vendor-internal churn.
+_NOISE_EXACT = frozenset(
+    {
+        # Darwin / macOS proxy + sysconfig
+        "_scproxy",
+        "_osx_support",
+        # Optional brotli compression backends (httpx/aiohttp transitive)
+        "_brotli",
+        "brotli",
+    }
+)
+_NOISE_PREFIXES = (
+    # CPython cython cache module names embed the cython version
+    "_cython_",
+    # Platform-tagged sysconfig data modules
+    "_sysconfigdata_",
+    # Pydantic internals reshape between minor releases and depend on
+    # cythonized core availability — track the public pydantic surface
+    # not its private layout.
+    "pydantic.",
+    "pydantic_core.",
+)
+
+
+def _filter_noise(modules: set[str]) -> set[str]:
+    return {
+        m
+        for m in modules
+        if m not in _NOISE_EXACT and not any(m.startswith(p) for p in _NOISE_PREFIXES)
+    }
+
+
 def _capture_snapshot(module_dotted: str) -> dict:
     """Run the probe script in a subprocess and parse the JSON output."""
     script = _probe_script(module_dotted)
@@ -201,8 +237,10 @@ def test_module_init_snapshot(module_dotted, label, fixtures, request):
     # new_modules is the noisiest — compare set membership only,
     # ignoring stdlib churn between Python minor versions by allowing
     # the set to grow (we only fail if previously-seen modules vanish).
-    expected_set = set(expected["new_modules"])
-    actual_set = set(snapshot["new_modules"])
+    # Filter out platform-specific / version-specific noise so a baseline
+    # captured on darwin still passes on linux CI (and vice versa).
+    expected_set = _filter_noise(set(expected["new_modules"]))
+    actual_set = _filter_noise(set(snapshot["new_modules"]))
     missing = expected_set - actual_set
     assert not missing, (
         f"{label}: imports that used to happen at module init no longer do: {sorted(missing)[:20]}"
