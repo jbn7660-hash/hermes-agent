@@ -82,6 +82,11 @@ from gateway._helpers.time import (  # noqa: E402,F401
     _is_fresh_gateway_interruption,
 )
 
+# _build_media_placeholder has moved to gateway/_helpers/media.py.
+# Re-exported below so existing `from gateway.run import _build_media_placeholder`
+# callers keep working.
+from gateway._helpers.media import _build_media_placeholder  # noqa: E402,F401
+
 _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"("  # transient/auxiliary status that should stay in logs, not Telegram chat
     r"auxiliary\s+.+\s+failed"
@@ -813,26 +818,7 @@ def _try_resolve_fallback_provider() -> dict | None:
     return None
 
 
-def _build_media_placeholder(event) -> str:
-    """Build a text placeholder for media-only events so they aren't dropped.
-
-    When a photo/document is queued during active processing and later
-    dequeued, only .text is extracted.  If the event has no caption,
-    the media would be silently lost.  This builds a placeholder that
-    the vision enrichment pipeline will replace with a real description.
-    """
-    parts = []
-    media_urls = getattr(event, "media_urls", None) or []
-    media_types = getattr(event, "media_types", None) or []
-    for i, url in enumerate(media_urls):
-        mtype = media_types[i] if i < len(media_types) else ""
-        if mtype.startswith("image/") or getattr(event, "message_type", None) == MessageType.PHOTO:
-            parts.append(f"[User sent an image: {url}]")
-        elif mtype.startswith("audio/"):
-            parts.append(f"[User sent audio: {url}]")
-        else:
-            parts.append(f"[User sent a file: {url}]")
-    return "\n".join(parts)
+# _build_media_placeholder: see gateway/_helpers/media.py (imported above).
 
 
 def _format_duration(seconds: float) -> str:
