@@ -144,6 +144,12 @@ _NOISE_EXACT = frozenset(
         # Optional brotli compression backends (httpx/aiohttp transitive)
         "_brotli",
         "brotli",
+        # Pydantic surface (top-level may or may not be imported during
+        # init depending on which transitive dep happens to need it)
+        "pydantic",
+        "pydantic_core",
+        # typing-inspection (newer pydantic helper, optional)
+        "typing_inspection",
     }
 )
 _NOISE_PREFIXES = (
@@ -156,6 +162,7 @@ _NOISE_PREFIXES = (
     # not its private layout.
     "pydantic.",
     "pydantic_core.",
+    "typing_inspection.",
 )
 
 
