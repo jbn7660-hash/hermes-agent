@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -144,6 +145,11 @@ _NOISE_EXACT = frozenset(
         # Optional brotli compression backends (httpx/aiohttp transitive)
         "_brotli",
         "brotli",
+        # C accelerators that may be absent on minimal CPython builds
+        # (./configure --without-decimal-contextvar, --disable-shared, etc.)
+        # or replaced by the pure-Python fallback (_pydecimal, pickle).
+        "_decimal",
+        "_pickle",
         # Pydantic surface (top-level may or may not be imported during
         # init depending on which transitive dep happens to need it)
         "pydantic",
@@ -164,13 +170,21 @@ _NOISE_PREFIXES = (
     "pydantic_core.",
     "typing_inspection.",
 )
+# mypyc-compiled module names carry a build-hash prefix that varies per
+# install (e.g. `81d243bd2c585b0f4821__mypyc`). Match by pattern so a
+# baseline captured with one mypyc build still validates against another.
+_NOISE_REGEX = (
+    re.compile(r"^[a-f0-9]{8,}__mypyc$"),
+)
 
 
 def _filter_noise(modules: set[str]) -> set[str]:
     return {
         m
         for m in modules
-        if m not in _NOISE_EXACT and not any(m.startswith(p) for p in _NOISE_PREFIXES)
+        if m not in _NOISE_EXACT
+        and not any(m.startswith(p) for p in _NOISE_PREFIXES)
+        and not any(r.match(m) for r in _NOISE_REGEX)
     }
 
 
