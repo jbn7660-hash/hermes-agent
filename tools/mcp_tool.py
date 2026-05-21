@@ -3345,7 +3345,16 @@ def is_mcp_tool_parallel_safe(tool_name: str) -> bool:
         return False
     with _lock:
         server_name = _mcp_tool_server_names.get(tool_name)
-        return bool(server_name and server_name in _parallel_safe_servers)
+        if server_name:
+            return server_name in _parallel_safe_servers
+        # Compatibility fallback for synthetic tests and tools registered before
+        # exact provenance was recorded. Prefer the exact map above because MCP
+        # server names can contain underscores, making prefix parsing ambiguous.
+        remainder = tool_name[4:]
+        return any(
+            remainder == server or remainder.startswith(f"{server}_")
+            for server in _parallel_safe_servers
+        )
 
 
 def get_mcp_status() -> List[dict]:

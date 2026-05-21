@@ -54,6 +54,9 @@ _HERMES_CORE_TOOLS = [
     "clarify",
     # Code execution + delegation
     "execute_code", "delegate_task",
+    # External LLM wrappers (Claude Code/Opus/Review, Codex web/consult, Gemini scan)
+    "claude_code_task", "claude_plan_task", "claude_opus_task", "claude_review_task",
+    "codex_web_research", "codex_consult_task", "gemini_scan_task",
     # Cronjob management
     "cronjob",
     # Cross-platform messaging (gated on gateway running via check_fn)
@@ -148,6 +151,15 @@ TOOLSETS = {
     "moa": {
         "description": "Advanced reasoning and problem-solving tools",
         "tools": ["mixture_of_agents"],
+        "includes": []
+    },
+
+    "external_llm": {
+        "description": "Route heavy work to local Claude Code, Claude Opus/Review, Codex web/consult, and Gemini CLI wrappers",
+        "tools": [
+            "claude_code_task", "claude_plan_task", "claude_opus_task", "claude_review_task",
+            "codex_web_research", "codex_consult_task", "gemini_scan_task",
+        ],
         "includes": []
     },
     
