@@ -14,6 +14,8 @@ Improvements over v2:
   - Tool output pruning before LLM summarization (cheap pre-pass)
   - Scaled summary budget (proportional to compressed content)
   - Richer tool call/result detail in summarizer input
+
+See also: website/docs/agent-guide/internals/context-compression-and-caching.md
 """
 
 import hashlib
@@ -1417,7 +1419,7 @@ The user has requested that this compaction PRIORITISE preserving all informatio
         the budget is reached. Returns the index where the tail starts.
 
         ``token_budget`` defaults to ``self.tail_token_budget`` which is
-        derived from ``summary_target_ratio * context_length``, so it
+        derived from ``summary_target_ratio * threshold_tokens``, so it
         scales automatically with the model's context window.
 
         Token budget is the primary criterion.  A hard minimum of 3 messages
