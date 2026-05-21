@@ -12,7 +12,7 @@ The core orchestration engine is `run_agent.py`'s `AIAgent` class — a large fi
 
 `AIAgent` is responsible for:
 
-- Assembling the effective system prompt and tool schemas via `prompt_builder.py`
+- Assembling the effective system prompt and tool schemas via `agent/system_prompt.py` (entry point — `build_system_prompt_parts()`) and `agent/prompt_builder.py` (context file discovery, SOUL loading, security scanning, guidance string constants)
 - Selecting the correct provider/API mode (chat_completions, codex_responses, anthropic_messages)
 - Making interruptible model calls with cancellation support
 - Executing tool calls (sequentially or concurrently via thread pool)
@@ -200,8 +200,12 @@ The fallback system also covers auxiliary tasks independently — vision, compre
 
 ### When Compression Triggers
 
-- **Preflight** (before API call): If conversation exceeds 50% of model's context window
-- **Gateway auto-compression**: If conversation exceeds 85% (more aggressive, runs between turns)
+Hermes runs **two independent compression layers** at different thresholds — see [Context Compression and Caching](./context-compression-and-caching.md) for the full architecture:
+
+- **Preflight, inside the agent loop** (50% threshold): `ContextCompressor.threshold_percent` defaults to `0.50` in `agent/context_compressor.py`. Fires when prompt tokens reach 50% of the model's context window, using real API-reported token counts.
+- **Gateway session hygiene** (85% threshold): `_hyg_threshold_pct = 0.85` in `gateway/run.py` (see the comment block — hygiene is deliberately higher than the agent's own compressor to avoid premature compression on every gateway turn). Fires pre-agent on long-lived gateway sessions (Telegram, Discord, etc.) that grew too large between turns.
+
+The orchestration entry point for both paths is `compress_context()` in `agent/conversation_compression.py`, which is invoked by the agent's tool loop (`agent/conversation_loop.py`) and by `run_agent.py`'s thin `_compress_context` forwarder.
 
 ### What Happens During Compression
 
@@ -209,7 +213,7 @@ The fallback system also covers auxiliary tasks independently — vision, compre
 2. Middle conversation turns are summarized into a compact summary
 3. The last N messages are preserved intact (`compression.protect_last_n`, default: 20)
 4. Tool call/result message pairs are kept together (never split)
-5. A new session lineage ID is generated (compression creates a "child" session)
+5. A new session lineage ID is generated (compression creates a "child" session). The rotation lives in `compress_context()` in `agent/conversation_compression.py`: the new id is minted via `session_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"` and the previous id is stored as `parent_session_id=old_session_id` when the new session row is inserted, so the SQLite session DAG keeps the full lineage. `run_agent.py`'s `AIAgent._compress_context` is a thin forwarder into the same function.
 
 ### Session Persistence
 
@@ -222,13 +226,16 @@ After each turn:
 
 | File | Purpose |
 |------|---------|
-| `run_agent.py` | AIAgent class — the complete agent loop |
-| `agent/prompt_builder.py` | System prompt assembly from memory, skills, context files, personality |
-| `agent/context_engine.py` | ContextEngine ABC — pluggable context management |
-| `agent/context_compressor.py` | Default engine — lossy summarization algorithm |
-| `agent/prompt_caching.py` | Anthropic prompt caching markers and cache metrics |
-| `agent/auxiliary_client.py` | Auxiliary LLM client for side tasks (vision, summarization) |
-| `model_tools.py` | Tool schema collection, `handle_function_call()` dispatch |
+| `run_agent.py` | `AIAgent` class — agent state container and thin forwarders. Most heavy logic now lives in helper modules. |
+| `agent/system_prompt.py` | System prompt assembly entry point — `build_system_prompt_parts()` joins the stable / context / volatile tiers and returns them as a dict. |
+| `agent/prompt_builder.py` | Context file discovery (`.hermes.md`, `AGENTS.md`, `CLAUDE.md`, `.cursorrules`), SOUL loading, prompt-injection security scanning, and the static guidance string constants (`MEMORY_GUIDANCE`, `SKILLS_GUIDANCE`, etc.). |
+| `agent/conversation_loop.py` | The ~3,900-line `run_conversation()` body extracted from `AIAgent` — drives one user turn through model call, tool dispatch, retries, fallbacks, compression triggers, and post-turn hooks. |
+| `agent/conversation_compression.py` | `compress_context()` — orchestrates compaction, session-id rotation with `parent_session_id` lineage, memory provider notifications, and post-compression token re-estimation. |
+| `agent/context_engine.py` | `ContextEngine` ABC — pluggable context management. |
+| `agent/context_compressor.py` | Default engine — lossy summarization algorithm, 13-section summary template, `_find_tail_cut_by_tokens`, `abort_on_summary_failure` behavior. |
+| `agent/prompt_caching.py` | Anthropic prompt caching markers and cache metrics. |
+| `agent/auxiliary_client.py` | Auxiliary LLM client for side tasks (vision, summarization). |
+| `model_tools.py` | Tool schema collection, `handle_function_call()` dispatch. |
 
 ## Related Docs
 

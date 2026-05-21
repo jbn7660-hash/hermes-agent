@@ -20,39 +20,72 @@ This is one of the most important design choices in the project because it affec
 
 Primary files:
 
-- `run_agent.py`
-- `agent/prompt_builder.py`
-- `tools/memory_tool.py`
+- `agent/system_prompt.py` — entry point. `build_system_prompt_parts()` assembles all three tiers (stable / context / volatile) and returns them as a dict.
+- `agent/prompt_builder.py` — helper. Context file discovery (`build_context_files_prompt`, `_find_hermes_md`, `_load_agents_md`, `_load_claude_md`), SOUL loading (`load_soul_md`), security scanning of project context files, and the static guidance strings (`MEMORY_GUIDANCE`, `SKILLS_GUIDANCE`, `TOOL_USE_ENFORCEMENT_GUIDANCE`, etc.).
+- `run_agent.py` — owns the `AIAgent` runtime state; thin forwarders such as `_build_system_prompt` and `_invalidate_system_prompt` call into `agent/system_prompt.py`.
+- `tools/memory_tool.py` — writes `MEMORY.md` / `USER.md` that `agent/system_prompt.py` later snapshots into the volatile tier.
 
 ## Cached system prompt layers
 
-The cached system prompt is assembled in roughly this order:
+`build_system_prompt_parts()` in `agent/system_prompt.py` returns a `{"stable": ..., "context": ..., "volatile": ...}` dict, joined with `\n\n`. The three tiers exist on purpose — only the **stable** and **context** tiers survive unchanged across turns and contribute to upstream prefix-cache hits. The **volatile** tier is rebuilt every time the system prompt is regenerated (memory writes, USER.md edits, or compression-driven rebuilds invalidate it).
 
-1. agent identity — `SOUL.md` from `HERMES_HOME` when available, otherwise falls back to `DEFAULT_AGENT_IDENTITY` in `prompt_builder.py`
-2. tool-aware behavior guidance
-3. Honcho static block (when active)
-4. optional system message
-5. frozen MEMORY snapshot
-6. frozen USER profile snapshot
-7. skills index
-8. context files (`AGENTS.md`, `.cursorrules`, `.cursor/rules/*.mdc`) — SOUL.md is **not** included here when it was already loaded as the identity in step 1
-9. timestamp / optional session ID
-10. platform hint
+### Stable tier (identity + guidance — cached across turns)
 
-When `skip_context_files` is set (e.g., subagent delegation), SOUL.md is not loaded and the hardcoded `DEFAULT_AGENT_IDENTITY` is used instead.
+1. **Agent identity** — `SOUL.md` from `HERMES_HOME` via `load_soul_md()` when present, otherwise the hardcoded `DEFAULT_AGENT_IDENTITY` in `prompt_builder.py`
+2. `HERMES_AGENT_HELP_GUIDANCE` (pointer to the hermes-agent skill + docs)
+3. Tool-aware behavior guidance — `MEMORY_GUIDANCE`, `SESSION_SEARCH_GUIDANCE`, `SKILLS_GUIDANCE`, kanban worker/orchestrator block when relevant
+4. `COMPUTER_USE_GUIDANCE` when `computer_use` tool is loaded
+5. Nous subscription block (when active)
+6. `TOOL_USE_ENFORCEMENT_GUIDANCE` (model-gated) — augmented by `GOOGLE_MODEL_OPERATIONAL_GUIDANCE` for Gemini/Gemma and `OPENAI_MODEL_EXECUTION_GUIDANCE` for GPT/Codex/Grok
+7. Skills index (when `skills_list` / `skill_view` / `skill_manage` tools are present)
+8. Alibaba model-name workaround (provider-gated)
+9. Environment hints (WSL, Termux, etc.) — `build_environment_hints()`
+10. Platform hint — `PLATFORM_HINTS[platform_key]` or plugin-supplied
+
+### Context tier (cwd-dependent — cached for the session)
+
+11. Optional caller-supplied `system_message`
+12. Context files (`.hermes.md`, `AGENTS.md`, `CLAUDE.md`, `.cursorrules`, `.cursor/rules/*.mdc`) discovered under `TERMINAL_CWD` via `build_context_files_prompt()` — `SOUL.md` is excluded here when `_soul_loaded=True` (passed in as `skip_soul=_soul_loaded`) to prevent double injection
+
+### Volatile tier (rebuilt every render — never cached safely)
+
+13. **MEMORY snapshot** — `agent._memory_store.format_for_system_prompt("memory")`. Mid-session writes to `MEMORY.md` update disk state but the **already-built** system prompt keeps the old snapshot until `invalidate_system_prompt()` triggers a rebuild (called by compression).
+14. **USER profile snapshot** — `agent._memory_store.format_for_system_prompt("user")`. Same lifecycle as the MEMORY snapshot.
+15. External memory provider block — `agent._memory_manager.build_system_prompt()` when a plugin provider is attached.
+16. Timestamp + optional session ID + model + provider line. Date-only granularity (not minute-precision) to keep the prompt byte-stable for the day.
+
+> Note: memory and USER profile sit in the **volatile** tier even though they only change once per session in practice — they are still excluded from the cache-friendly prefix so memory tool writes do not poison stale prompt caches. If you rely on prompt caching benchmarks, treat the entire volatile tier as the cache-invalidation boundary.
+
+### SOUL.md load condition
+
+`agent/system_prompt.py:89-94` gates SOUL loading on `if agent.load_soul_identity or not agent.skip_context_files:`. So:
+
+| `load_soul_identity` | `skip_context_files` | Result |
+|---------------------:|---------------------:|--------|
+| `False` (default)    | `False` (default)    | SOUL loaded as identity, project context files loaded |
+| `False`              | `True` (e.g. subagent delegation) | SOUL **not** loaded — fall back to `DEFAULT_AGENT_IDENTITY`, project context files skipped |
+| `True` (e.g. cron worker) | `True` | SOUL **still loaded** as identity; project context files skipped |
+| `True`               | `False`              | SOUL loaded; project context files loaded (same as default but explicit) |
+
+Setting `load_soul_identity=True` is how cron mode and similar isolated execution paths keep the `HERMES_HOME` persona while disabling cwd-derived project instructions. The `_soul_loaded` flag is then passed as `skip_soul=_soul_loaded` into `build_context_files_prompt()` so SOUL.md is not injected a second time as a project context file.
 
 ### Concrete example: assembled system prompt
 
-Here is a simplified view of what the final system prompt looks like when all layers are present (comments show the source of each section):
+Here is a simplified view of what the final system prompt looks like when all layers are present (comments show the tier and the source of each section). The three tiers are joined with `\n\n` in this order: `stable`, `context`, `volatile`.
 
 ```
-# Layer 1: Agent Identity (from ~/.hermes/SOUL.md)
+# ── Stable tier (cached across all turns) ─────────────────────────
+
+# [stable] Agent Identity (from ~/.hermes/SOUL.md)
 You are Hermes, an AI assistant created by Nous Research.
 You are an expert software engineer and researcher.
 You value correctness, clarity, and efficiency.
 ...
 
-# Layer 2: Tool-aware behavior guidance
+# [stable] HERMES_AGENT_HELP_GUIDANCE
+For questions about Hermes itself, load the hermes-agent skill.
+
+# [stable] Tool-aware behavior guidance
 You have persistent memory across sessions. Save durable facts using
 the memory tool: user preferences, environment details, tool quirks,
 and stable conventions. Memory is injected into every turn, so keep
@@ -62,30 +95,12 @@ When the user references something from a past conversation or you
 suspect relevant cross-session context exists, use session_search
 to recall it before asking them to repeat themselves.
 
-# Tool-use enforcement (for GPT/Codex models only)
+# [stable] TOOL_USE_ENFORCEMENT_GUIDANCE (for GPT/Codex/Grok models only)
 You MUST use your tools to take action — do not describe what you
 would do or plan to do without actually doing it.
 ...
 
-# Layer 3: Honcho static block (when active)
-[Honcho personality/context data]
-
-# Layer 4: Optional system message (from config or API)
-[User-configured system message override]
-
-# Layer 5: Frozen MEMORY snapshot
-## Persistent Memory
-- User prefers Python 3.12, uses pyproject.toml
-- Default editor is nvim
-- Working on project "atlas" in ~/code/atlas
-- Timezone: US/Pacific
-
-# Layer 6: Frozen USER profile snapshot
-## User Profile
-- Name: Alice
-- GitHub: alice-dev
-
-# Layer 7: Skills index
+# [stable] Skills index
 ## Skills (mandatory)
 Before replying, scan the skills below. If one clearly matches
 your task, load it with skill_view(name) and follow its instructions.
@@ -98,7 +113,16 @@ your task, load it with skill_view(name) and follow its instructions.
     - arxiv: Search and summarize arXiv papers
 </available_skills>
 
-# Layer 8: Context files (from project directory)
+# [stable] Environment hints + platform hint
+You are a CLI AI Agent. Try not to use markdown but simple text
+renderable inside a terminal.
+
+# ── Context tier (cwd-dependent, cached for the session) ──────────
+
+# [context] Optional caller-supplied system message
+[User-configured system message override]
+
+# [context] Project context files (from project directory)
 # Project Context
 The following project context files have been loaded and should be followed:
 
@@ -107,13 +131,25 @@ This is the atlas project. Use pytest for testing. The main
 entry point is src/atlas/main.py. Always run `make lint` before
 committing.
 
-# Layer 9: Timestamp + session
-Current time: 2026-03-30T14:30:00-07:00
-Session: abc123
+# ── Volatile tier (rebuilt every render — never cache-stable) ─────
 
-# Layer 10: Platform hint
-You are a CLI AI Agent. Try not to use markdown but simple text
-renderable inside a terminal.
+# [volatile] MEMORY snapshot
+## Persistent Memory
+- User prefers Python 3.12, uses pyproject.toml
+- Default editor is nvim
+- Working on project "atlas" in ~/code/atlas
+- Timezone: US/Pacific
+
+# [volatile] USER profile snapshot
+## User Profile
+- Name: Alice
+- GitHub: alice-dev
+
+# [volatile] Timestamp + session metadata
+Conversation started: Monday, March 30, 2026
+Session ID: abc123
+Model: claude-sonnet-4.6
+Provider: anthropic
 ```
 
 ## How SOUL.md appears in the prompt

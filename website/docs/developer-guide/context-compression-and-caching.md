@@ -147,47 +147,100 @@ Boundaries are aligned to avoid splitting tool_call/tool_result groups.
 The `_align_boundary_backward()` method walks past consecutive tool results
 to find the parent assistant message, keeping groups intact.
 
+#### Tail boundary detection (`_find_tail_cut_by_tokens`)
+
+`_find_tail_cut_by_tokens()` (in `agent/context_compressor.py`) walks backward from the end of the message list and accumulates per-message token estimates until the **token budget** is reached. The token budget defaults to `self.tail_token_budget`, which is derived from `summary_target_ratio × threshold_tokens` so it scales with the model's context window.
+
+The walk obeys three guardrails, in this priority order:
+
+1. **Token budget (primary)** — accumulate until exceeded. A 1.5× soft ceiling is allowed so a single oversized message (large tool output, file read) does not get sliced in half.
+2. **Hard minimum of 3 messages** — always protect at least 3 messages in the tail (`min_tail = min(3, n - head_end - 1)`). If even 3 messages exceed 1.5× the budget, the cut is placed right after the head so compression still runs.
+3. **Last-user-message anchor** — `_ensure_last_user_message_in_tail()` walks forward from the candidate cut to guarantee the most recent user message stays in the tail. This is critical: losing the most recent user turn to compression silently discards the "active task" the agent is supposed to continue.
+
+The final cut index is then aligned via `_align_boundary_backward()` to avoid splitting tool_call / tool_result groups.
+
 ### Phase 3: Generate Structured Summary
 
 :::warning Summary model context length
 The summary model must have a context window **at least as large** as the main agent model's. The entire middle section is sent to the summary model in a single `call_llm(task="compression")` call. If the summary model's context is smaller, the API returns a context-length error — `_generate_summary()` catches it, logs a warning, and returns `None`. The compressor then drops the middle turns **without a summary**, silently losing conversation context. This is the most common cause of degraded compaction quality.
 :::
 
-The middle turns are summarized using the auxiliary LLM with a structured
-template:
+The middle turns are summarized using the auxiliary LLM with a 13-section structured template defined in `context_compressor.py` (`_template_sections` inside `_generate_summary`). The sections are emitted in this exact order so the summary remains parseable and so iterative re-compactions can merge cleanly:
 
 ```
+## Active Task
+[THE SINGLE MOST IMPORTANT FIELD. Copy the user's most recent request or
+task assignment verbatim — the exact words they used. If multiple tasks
+were requested and only some are done, list only the ones NOT yet completed.
+Continuation should pick up exactly here. Example:
+"User asked: 'Now refactor the auth module to use JWT instead of sessions'"
+If no outstanding task exists, write "None."]
+
 ## Goal
-[What the user is trying to accomplish]
+[What the user is trying to accomplish overall]
 
 ## Constraints & Preferences
 [User preferences, coding style, constraints, important decisions]
 
-## Progress
-### Done
-[Completed work — specific file paths, commands run, results]
-### In Progress
-[Work currently underway]
-### Blocked
-[Any blockers or issues encountered]
+## Completed Actions
+[Numbered list of concrete actions taken — include tool used, target, and outcome.
+Format each as: N. ACTION target — outcome [tool: name]
+Example:
+1. READ config.py:45 — found `==` should be `!=` [tool: read_file]
+2. PATCH config.py:45 — changed `==` to `!=` [tool: patch]
+3. TEST `pytest tests/` — 3/50 failed: test_parse, test_validate, test_edge [tool: terminal]
+Be specific with file paths, commands, line numbers, and results.]
+
+## Active State
+[Current working state — include:
+- Working directory and branch (if applicable)
+- Modified/created files with brief note on each
+- Test status (X/Y passing)
+- Any running processes or servers
+- Environment details that matter]
+
+## In Progress
+[Work currently underway — what was being done when compaction fired]
+
+## Blocked
+[Any blockers, errors, or issues not yet resolved. Include exact error messages.]
 
 ## Key Decisions
-[Important technical decisions and why]
+[Important technical decisions and WHY they were made]
+
+## Resolved Questions
+[Questions the user asked that were ALREADY answered — include the answer so it is not repeated]
+
+## Pending User Asks
+[Questions or requests from the user that have NOT yet been answered or fulfilled. If none, write "None."]
 
 ## Relevant Files
 [Files read, modified, or created — with brief note on each]
 
-## Next Steps
-[What needs to happen next]
+## Remaining Work
+[What remains to be done — framed as context, not instructions]
 
 ## Critical Context
-[Specific values, error messages, configuration details]
+[Any specific values, error messages, configuration details, or data that would be lost without explicit preservation. NEVER include API keys, tokens, passwords, or credentials — write [REDACTED] instead.]
 ```
+
+`## Active Task` is **the single most important field** — the inline comment in `context_compressor.py` calls it out explicitly. It carries the verbatim text of the user's most recent unfulfilled request so that the next session can resume on exactly the work that was in flight when compaction fired. The `Remaining Work` section (note: this was previously called `Next Steps` in older docs — the field has been renamed in code) frames pending work as observable context rather than as instructions, so the model does not treat the summary itself as a fresh user prompt.
 
 Summary budget scales with the amount of content being compressed:
 - Formula: `content_tokens × 0.20` (the `_SUMMARY_RATIO` constant)
 - Minimum: 2,000 tokens
 - Maximum: `min(context_length × 0.05, 12,000)` tokens
+
+#### Summary-generation failure behavior (`abort_on_summary_failure`)
+
+If `_generate_summary()` returns `None` (auxiliary LLM error, context length overflow, network failure), behavior splits on the `abort_on_summary_failure` constructor parameter (configurable via `compression.abort_on_summary_failure` in `config.yaml`):
+
+| `abort_on_summary_failure` | Behavior |
+|----------------------------|----------|
+| `True` | **Abort compression entirely.** Return the original messages unchanged and set `_last_compress_aborted=True`. The gateway and `/compress` handlers detect this flag and surface a warning to the user. The conversation is "frozen" — no middle drop, no static placeholder — until the user manually retries with `/compress` or starts a fresh session with `/new`. |
+| `False` (default) | **Legacy fallback path.** Insert a static `"summary unavailable"` placeholder where the middle window was, drop the middle turns, and continue. `_last_summary_fallback_used` and `_last_summary_dropped_count` are recorded so the gateway hygiene layer can surface a visible warning to the user. |
+
+The default is `False` to preserve historical behavior, but new deployments are encouraged to enable `abort_on_summary_failure=true` — silently dropping the middle window after a summary failure is the most common cause of "the agent suddenly forgot everything we did".
 
 ### Phase 4: Assemble Compressed Messages
 
@@ -240,17 +293,18 @@ text for this purpose.
 [1] user:      "Help me set up a FastAPI project"
 [2] assistant: "[CONTEXT COMPACTION] Earlier turns were compacted...
 
+               ## Active Task
+               User asked: 'Great, also add error handling'
+
                ## Goal
                Set up a FastAPI project with tests and error handling
 
-               ## Progress
-               ### Done
-               - Created project structure: main.py, tests/, requirements.txt
-               - Implemented 5 API endpoints in main.py
-               - Wrote 10 test cases in tests/test_api.py
-               - 8/10 tests passing
+               ## Completed Actions
+               1. CREATE main.py — FastAPI app with 5 endpoints [tool: write_file]
+               2. CREATE tests/test_api.py — 10 test cases [tool: write_file]
+               3. TEST `pytest tests/` — 8/10 passed; failed: test_create_user, test_delete_user [tool: terminal]
 
-               ### In Progress
+               ## In Progress
                - Fixing 2 failing tests (test_create_user, test_delete_user)
 
                ## Relevant Files
@@ -258,7 +312,7 @@ text for this purpose.
                - tests/test_api.py — 10 test cases
                - requirements.txt — fastapi, pytest, httpx
 
-               ## Next Steps
+               ## Remaining Work
                - Fix failing test fixtures
                - Add error handling"
 [3] user:      "Fix the failing tests"
