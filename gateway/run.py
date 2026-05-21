@@ -375,10 +375,17 @@ _ensure_ssl_certs()
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-# Resolve Hermes home directory (respects HERMES_HOME override)
-from hermes_constants import get_hermes_home
+# Resolve Hermes home directory (respects HERMES_HOME override).
+# The module-level ``_hermes_home`` snapshot lives in
+# ``gateway/_helpers/paths.py`` so the eight runner helpers that still
+# close over it (per Plan v3 audit) can be relocated in a later phase
+# without each extraction re-importing ``get_hermes_home``.  The import
+# below re-binds the name into this module so all 50+ in-file consumers
+# and tests that ``monkeypatch.setattr(gateway.run, "_hermes_home", ...)``
+# continue to work unchanged.
+from hermes_constants import get_hermes_home  # noqa: F401 — still used at module-global func sites below
 from utils import atomic_json_write, atomic_yaml_write, base_url_host_matches, is_truthy_value
-_hermes_home = get_hermes_home()
+from gateway._helpers.paths import _hermes_home  # noqa: E402,F401
 
 # Load environment variables from ~/.hermes/.env first.
 # User-managed env files should override stale shell exports on restart.
