@@ -6,7 +6,7 @@ description: "Detailed walkthrough of AIAgent execution, API modes, tools, callb
 
 # Agent Loop Internals
 
-The core orchestration engine is `run_agent.py`'s `AIAgent` class — a large file (15k+ lines) that handles everything from prompt assembly to tool dispatch to provider failover.
+The core orchestration engine is `run_agent.py`'s `AIAgent` class, but the former monolith has been split into focused helper modules. `run_agent.py` now acts mostly as the agent state container plus compatibility forwarders; prompt assembly lives in `agent/system_prompt.py`, the turn loop in `agent/conversation_loop.py`, initialization in `agent/agent_init.py`, and compression orchestration in `agent/conversation_compression.py`.
 
 ## Core Responsibilities
 
@@ -64,13 +64,13 @@ Each iteration of the agent loop follows this sequence:
 run_conversation()
   1. Generate task_id if not provided
   2. Append user message to conversation history
-  3. Build or reuse cached system prompt (prompt_builder.py)
-  4. Check if preflight compression is needed (>50% context)
+  3. Build or reuse cached system prompt (`agent/system_prompt.py`)
+  4. Apply pre-LLM plugin overlays to the current user message, then check if preflight compression is needed (>50% context by rough request estimate)
   5. Build API messages from conversation history
      - chat_completions: OpenAI format as-is
      - codex_responses: convert to Responses API input items
      - anthropic_messages: convert via anthropic_adapter.py
-  6. Inject ephemeral prompt layers (budget warnings, context pressure)
+  6. Inject API-call-only ephemeral prompt layers where supported (budget warnings, context pressure)
   7. Apply prompt caching markers if on Anthropic
   8. Make interruptible API call (_interruptible_api_call)
   9. Parse response:
@@ -211,7 +211,7 @@ The orchestration entry point for both paths is `compress_context()` in `agent/c
 
 1. Memory is flushed to disk first (preventing data loss)
 2. Middle conversation turns are summarized into a compact summary
-3. The last N messages are preserved intact (`compression.protect_last_n`, default: 20)
+3. Recent tail context is preserved by token budget first; `compression.protect_last_n` (default: 20) is a minimum/fallback guard, and the latest user message is anchored so the active task is not summarized away
 4. Tool call/result message pairs are kept together (never split)
 5. A new session lineage ID is generated (compression creates a "child" session). The rotation lives in `compress_context()` in `agent/conversation_compression.py`: the new id is minted via `session_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"` and the previous id is stored as `parent_session_id=old_session_id` when the new session row is inserted, so the SQLite session DAG keeps the full lineage. `run_agent.py`'s `AIAgent._compress_context` is a thin forwarder into the same function.
 
@@ -232,7 +232,7 @@ After each turn:
 | `agent/conversation_loop.py` | The ~3,900-line `run_conversation()` body extracted from `AIAgent` — drives one user turn through model call, tool dispatch, retries, fallbacks, compression triggers, and post-turn hooks. |
 | `agent/conversation_compression.py` | `compress_context()` — orchestrates compaction, session-id rotation with `parent_session_id` lineage, memory provider notifications, and post-compression token re-estimation. |
 | `agent/context_engine.py` | `ContextEngine` ABC — pluggable context management. |
-| `agent/context_compressor.py` | Default engine — lossy summarization algorithm, 13-section summary template, `_find_tail_cut_by_tokens`, `abort_on_summary_failure` behavior. |
+| `agent/context_compressor.py` | Default engine — lossy summarization algorithm, 13-section summary template, `_find_tail_cut_by_tokens`, extractive fallback behavior. |
 | `agent/prompt_caching.py` | Anthropic prompt caching markers and cache metrics. |
 | `agent/auxiliary_client.py` | Auxiliary LLM client for side tasks (vision, summarization). |
 | `model_tools.py` | Tool schema collection, `handle_function_call()` dispatch. |

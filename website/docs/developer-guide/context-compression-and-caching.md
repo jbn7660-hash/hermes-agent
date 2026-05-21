@@ -99,8 +99,8 @@ auxiliary:
 |-----------|---------|-------|-------------|
 | `threshold` | `0.50` | 0.0-1.0 | Compression triggers when prompt tokens ≥ `threshold × context_length` |
 | `target_ratio` | `0.20` | 0.10-0.80 | Controls tail protection token budget: `threshold_tokens × target_ratio` |
-| `protect_last_n` | `20` | ≥1 | Minimum number of recent messages always preserved |
-| `protect_first_n` | `3` | (hardcoded) | System prompt + first exchange always preserved |
+| `protect_last_n` | `20` | ≥1 | Minimum/fallback guard for recent messages; tail selection is token-budget based first |
+| `protect_first_n` | `3` | ≥0 | System prompt, if present, is implicitly protected; this preserves 3 additional non-system head messages by default |
 
 ### Computed Values (for a 200K context model at defaults)
 
@@ -132,16 +132,17 @@ outputs (file contents, terminal output, search results).
 ┌─────────────────────────────────────────────────────────────┐
 │  Message list                                               │
 │                                                             │
-│  [0..2]  ← protect_first_n (system + first exchange)        │
-│  [3..N]  ← middle turns → SUMMARIZED                        │
-│  [N..end] ← tail (by token budget OR protect_last_n)        │
+│  [system] + first protect_first_n non-system messages       │
+│          ← protected head                                   │
+│  middle turns → SUMMARIZED                                  │
+│  tail ← token budget first, protect_last_n as floor/guard   │
 │                                                             │
 └─────────────────────────────────────────────────────────────┘
 ```
 
 Tail protection is **token-budget based**: walks backward from the end,
-accumulating tokens until the budget is exhausted. Falls back to the fixed
-`protect_last_n` count if the budget would protect fewer messages.
+accumulating tokens until the budget is exhausted. `protect_last_n` is a
+minimum/fallback guard, not the primary selector.
 
 Boundaries are aligned to avoid splitting tool_call/tool_result groups.
 The `_align_boundary_backward()` method walks past consecutive tool results
@@ -162,7 +163,7 @@ The final cut index is then aligned via `_align_boundary_backward()` to avoid sp
 ### Phase 3: Generate Structured Summary
 
 :::warning Summary model context length
-The summary model must have a context window **at least as large** as the main agent model's. The entire middle section is sent to the summary model in a single `call_llm(task="compression")` call. If the summary model's context is smaller, the API returns a context-length error — `_generate_summary()` catches it, logs a warning, and returns `None`. The compressor then drops the middle turns **without a summary**, silently losing conversation context. This is the most common cause of degraded compaction quality.
+The summary model must have a context window **at least as large** as the main agent model's. The entire middle section is sent to the summary model in a single `call_llm(task="compression")` call. If the summary model's context is smaller, the API returns a context-length error — `_generate_summary()` catches it, logs a warning, and returns `None`. The compressor then inserts a deterministic extractive fallback summary with redacted snippets and records `_last_summary_fallback_used` / `_last_summary_dropped_count` so gateway and `/compress` callers can warn the user. This avoids a blank "summary unavailable" placeholder while still compacting the middle window.
 :::
 
 The middle turns are summarized using the auxiliary LLM with a 13-section structured template defined in `context_compressor.py` (`_template_sections` inside `_generate_summary`). The sections are emitted in this exact order so the summary remains parseable and so iterative re-compactions can merge cleanly:
@@ -231,16 +232,11 @@ Summary budget scales with the amount of content being compressed:
 - Minimum: 2,000 tokens
 - Maximum: `min(context_length × 0.05, 12,000)` tokens
 
-#### Summary-generation failure behavior (`abort_on_summary_failure`)
+#### Summary-generation failure behavior
 
-If `_generate_summary()` returns `None` (auxiliary LLM error, context length overflow, network failure), behavior splits on the `abort_on_summary_failure` constructor parameter (configurable via `compression.abort_on_summary_failure` in `config.yaml`):
+If `_generate_summary()` returns `None` (auxiliary LLM error, context length overflow, network failure), compression no longer aborts and no longer inserts a blank static placeholder. Instead, `ContextCompressor.compress()` builds a deterministic extractive fallback summary from the middle window, redacts sensitive values, records `_last_summary_fallback_used=True` and `_last_summary_dropped_count`, then continues assembling the compacted transcript.
 
-| `abort_on_summary_failure` | Behavior |
-|----------------------------|----------|
-| `True` | **Abort compression entirely.** Return the original messages unchanged and set `_last_compress_aborted=True`. The gateway and `/compress` handlers detect this flag and surface a warning to the user. The conversation is "frozen" — no middle drop, no static placeholder — until the user manually retries with `/compress` or starts a fresh session with `/new`. |
-| `False` (default) | **Legacy fallback path.** Insert a static `"summary unavailable"` placeholder where the middle window was, drop the middle turns, and continue. `_last_summary_fallback_used` and `_last_summary_dropped_count` are recorded so the gateway hygiene layer can surface a visible warning to the user. |
-
-The default is `False` to preserve historical behavior, but new deployments are encouraged to enable `abort_on_summary_failure=true` — silently dropping the middle window after a summary failure is the most common cause of "the agent suddenly forgot everything we did".
+That means callers still get a smaller transcript, but the summary clearly says the LLM summarizer failed and preserves representative redacted snippets from the dropped window. Gateway hygiene and `/compress` paths use the fallback metadata to surface visible warnings when quality degraded.
 
 ### Phase 4: Assemble Compressed Messages
 

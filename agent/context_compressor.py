@@ -14,8 +14,6 @@ Improvements over v2:
   - Tool output pruning before LLM summarization (cheap pre-pass)
   - Scaled summary budget (proportional to compressed content)
   - Richer tool call/result detail in summarizer input
-
-See also: website/docs/agent-guide/internals/context-compression-and-caching.md
 """
 
 import hashlib
@@ -152,6 +150,59 @@ def _append_text_to_content(content: Any, text: str, *, prepend: bool = False) -
     return text + rendered if prepend else rendered + text
 
 
+_IMAGE_PART_TYPES = frozenset({"image", "image_url", "input_image"})
+_STRIPPED_IMAGE_PLACEHOLDER = "[Attached image — stripped after compression]"
+
+
+def _is_image_part(part: Any) -> bool:
+    return isinstance(part, dict) and part.get("type") in _IMAGE_PART_TYPES
+
+
+def _content_has_images(content: Any) -> bool:
+    return isinstance(content, list) and any(_is_image_part(part) for part in content)
+
+
+def _strip_images_from_content(content: Any) -> Any:
+    if not isinstance(content, list) or not _content_has_images(content):
+        return content
+    out = []
+    for part in content:
+        if _is_image_part(part):
+            out.append({"type": "text", "text": _STRIPPED_IMAGE_PLACEHOLDER})
+        else:
+            out.append(part)
+    return out
+
+
+def _strip_historical_media(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Strip image payloads before the newest image-bearing user turn.
+
+    Keeps the most recent user-supplied image available for the current task,
+    but prevents older base64/media blobs from being re-sent after compression.
+    Returns the original list when no stripping is needed.
+    """
+    anchor_idx = None
+    for idx in range(len(messages) - 1, -1, -1):
+        msg = messages[idx]
+        if isinstance(msg, dict) and msg.get("role") == "user" and _content_has_images(msg.get("content")):
+            anchor_idx = idx
+            break
+    if anchor_idx is None:
+        return messages
+
+    changed = False
+    out: List[Dict[str, Any]] = []
+    for idx, msg in enumerate(messages):
+        if idx < anchor_idx and isinstance(msg, dict) and _content_has_images(msg.get("content")):
+            new_msg = msg.copy()
+            new_msg["content"] = _strip_images_from_content(msg.get("content"))
+            out.append(new_msg)
+            changed = True
+        else:
+            out.append(msg)
+    return out if changed else messages
+
+
 def _strip_image_parts_from_parts(parts: Any) -> Any:
     """Strip image parts from an OpenAI-style content-parts list.
 
@@ -221,114 +272,6 @@ def _truncate_tool_call_args_json(args: str, head_chars: int = 200) -> str:
     shrunken = _shrink(parsed)
     # ensure_ascii=False preserves CJK/emoji instead of bloating with \uXXXX
     return json.dumps(shrunken, ensure_ascii=False)
-
-
-_IMAGE_PART_TYPES = frozenset({"image_url", "input_image", "image"})
-
-
-def _is_image_part(part: Any) -> bool:
-    """True if ``part`` is a multimodal image content block.
-
-    Recognizes all three shapes the agent handles:
-      - OpenAI chat.completions: ``{"type": "image_url", "image_url": ...}``
-      - OpenAI Responses API:    ``{"type": "input_image", "image_url": "..."}``
-      - Anthropic native:        ``{"type": "image", "source": {...}}``
-    """
-    if not isinstance(part, dict):
-        return False
-    return part.get("type") in _IMAGE_PART_TYPES
-
-
-def _content_has_images(content: Any) -> bool:
-    """True if a message's ``content`` is a multimodal list with image parts."""
-    if not isinstance(content, list):
-        return False
-    return any(_is_image_part(p) for p in content)
-
-
-def _strip_images_from_content(content: Any) -> Any:
-    """Return a copy of ``content`` with every image part replaced by a
-    short text placeholder.
-
-    - String content is returned unchanged.
-    - Non-list, non-string content is returned unchanged.
-    - List content: image parts become ``{"type": "text", "text": "[Attached
-      image — stripped after compression]"}``; other parts are preserved as-is.
-
-    Input is never mutated.
-    """
-    if not isinstance(content, list):
-        return content
-    if not any(_is_image_part(p) for p in content):
-        return content
-
-    new_parts: List[Any] = []
-    for p in content:
-        if _is_image_part(p):
-            new_parts.append({
-                "type": "text",
-                "text": "[Attached image — stripped after compression]",
-            })
-        else:
-            new_parts.append(p)
-    return new_parts
-
-
-def _strip_historical_media(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Replace image parts in older messages with placeholder text.
-
-    The anchor is the *last* user message that has any image content. Every
-    message before that anchor gets its image parts replaced with a short
-    placeholder so the outgoing request stops re-shipping the same multi-MB
-    base-64 image blobs on every turn.
-
-    If no user message carries images, the list is returned unchanged.
-    If the only user message with images is the very first one (nothing
-    earlier to strip), the list is returned unchanged.
-
-    Shallow copies of touched messages only; input is never mutated.
-    Port of Kilo-Org/kilocode#9434 (adapted for the OpenAI-style message
-    shape the hermes compressor emits).
-    """
-    if not messages:
-        return messages
-
-    # Find the newest user message that carries at least one image part.
-    # We anchor on image-bearing user messages (not all user messages) so
-    # a plain text follow-up after a big-image turn still strips the old
-    # image — matching the problem kilocode#9434 set out to solve.
-    anchor = -1
-    for i in range(len(messages) - 1, -1, -1):
-        msg = messages[i]
-        if not isinstance(msg, dict):
-            continue
-        if msg.get("role") != "user":
-            continue
-        if _content_has_images(msg.get("content")):
-            anchor = i
-            break
-
-    if anchor <= 0:
-        # No image-bearing user message, or it's the very first message —
-        # nothing before it to strip.
-        return messages
-
-    changed = False
-    result: List[Dict[str, Any]] = []
-    for i, msg in enumerate(messages):
-        if i >= anchor or not isinstance(msg, dict):
-            result.append(msg)
-            continue
-        content = msg.get("content")
-        if not _content_has_images(content):
-            result.append(msg)
-            continue
-        new_msg = msg.copy()
-        new_msg["content"] = _strip_images_from_content(content)
-        result.append(new_msg)
-        changed = True
-
-    return result if changed else messages
 
 
 def _summarize_tool_result(tool_name: str, tool_args: str, tool_content: str) -> str:
@@ -477,6 +420,7 @@ class ContextCompressor(ContextEngine):
         self._last_summary_error = None
         self._last_summary_dropped_count = 0
         self._last_summary_fallback_used = False
+        self._last_compress_aborted = False
         self._last_aux_model_failure_error = None
         self._last_aux_model_failure_model = None
         self._last_compression_savings_pct = 100.0
@@ -488,7 +432,7 @@ class ContextCompressor(ContextEngine):
         model: str,
         context_length: int,
         base_url: str = "",
-        api_key: Any = "",
+        api_key: str = "",
         provider: str = "",
         api_mode: str = "",
     ) -> None:
@@ -525,7 +469,6 @@ class ContextCompressor(ContextEngine):
         config_context_length: int | None = None,
         provider: str = "",
         api_mode: str = "",
-        abort_on_summary_failure: bool = False,
     ):
         self.model = model
         self.base_url = base_url
@@ -537,11 +480,6 @@ class ContextCompressor(ContextEngine):
         self.protect_last_n = protect_last_n
         self.summary_target_ratio = max(0.10, min(summary_target_ratio, 0.80))
         self.quiet_mode = quiet_mode
-        # When True, summary-generation failure aborts compression entirely
-        # (returns messages unchanged, sets _last_compress_aborted=True).
-        # When False (default = historical behavior), insert a static
-        # "summary unavailable" placeholder and drop the middle window.
-        self.abort_on_summary_failure = abort_on_summary_failure
 
         self.context_length = get_model_context_length(
             model, base_url=base_url, api_key=api_key,
@@ -594,11 +532,9 @@ class ContextCompressor(ContextEngine):
         # (gateway hygiene, /compress) can surface a visible warning.
         self._last_summary_dropped_count: int = 0
         self._last_summary_fallback_used: bool = False
-        # When summary generation fails we now ABORT compression entirely
-        # and return the original messages unchanged instead of dropping
-        # the middle window with a static placeholder.  Callers inspect
-        # this flag to know "compression was attempted but aborted, freeze
-        # the chat until the user manually retries via /compress".
+        # Compatibility flag for older gateway/session warning paths. The
+        # current compressor no longer aborts on summary failure; it inserts an
+        # extractive fallback summary and records _last_summary_fallback_used.
         self._last_compress_aborted: bool = False
         # When a user-configured summary model fails and we recover by
         # retrying on the main model, record the failure so gateway /
@@ -884,6 +820,104 @@ class ContextCompressor(ContextEngine):
             parts.append(f"[{role.upper()}]: {content}")
 
         return "\n\n".join(parts)
+
+    def _build_extractive_fallback_summary(
+        self,
+        turns_to_summarize: List[Dict[str, Any]],
+        *,
+        dropped_count: int,
+        error_text: str,
+    ) -> str:
+        """Build a deterministic summary when the LLM summarizer is unavailable.
+
+        This is deliberately extractive rather than clever: preserve the most
+        recent user requests, assistant/tool actions, file paths, and command
+        snippets so compression failure degrades to a usable checkpoint instead
+        of a bare "context was lost" marker.  It never calls an LLM, so it works
+        during provider timeouts and keeps gateway turns moving.
+        """
+        serialized = self._serialize_for_summary(turns_to_summarize)
+        lines = [line.strip() for line in serialized.splitlines() if line.strip()]
+
+        latest_user = "None."
+        completed: list[str] = []
+        relevant_files: list[str] = []
+        critical: list[str] = []
+        file_pattern = re.compile(r"(?:(?:/|\./|~/)[\w.\-()/]+|[\w.\-()/]+\.(?:py|ts|tsx|js|jsx|json|ya?ml|md|toml|sh|txt))")
+        command_pattern = re.compile(r"`([^`]{3,160})`")
+
+        for line in lines:
+            if line.startswith("[USER]:"):
+                latest_user = line[len("[USER]:"):].strip() or latest_user
+            if line.startswith(("[ASSISTANT]:", "[TOOL RESULT")):
+                text = line
+                if len(text) > 280:
+                    text = text[:277].rstrip() + "..."
+                if text not in completed:
+                    completed.append(text)
+            for match in file_pattern.findall(line):
+                if match not in relevant_files:
+                    relevant_files.append(match)
+            for match in command_pattern.findall(line):
+                item = f"Command seen: `{match}`"
+                if item not in critical:
+                    critical.append(item)
+
+        recent_lines = lines[-12:]
+        recent = []
+        for line in recent_lines:
+            if len(line) > 320:
+                line = line[:317].rstrip() + "..."
+            recent.append(f"- {line}")
+
+        completed_block = "\n".join(
+            f"{idx}. {item}" for idx, item in enumerate(completed[-12:], start=1)
+        ) or "None captured."
+        files_block = "\n".join(f"- {item}" for item in relevant_files[:30]) or "None captured."
+        critical_block = "\n".join(f"- {item}" for item in critical[:20]) or "None captured."
+        recent_block = "\n".join(recent) or "- No recoverable text captured."
+
+        return self._with_summary_prefix(redact_sensitive_text(f"""## Active Task
+{latest_user}
+
+## Goal
+Continue the latest user request using the remaining live transcript and current filesystem/state. This checkpoint was generated locally because the LLM compression summarizer failed.
+
+## Constraints & Preferences
+Preserve user preferences from the system prompt and persistent memory. Treat this extractive summary as incomplete but authoritative for the dropped turns it quotes.
+
+## Completed Actions
+{completed_block}
+
+## Active State
+Compression fallback used after dropping {dropped_count} message(s). Summarizer error: {error_text or 'unknown'}.
+
+## In Progress
+Resume from the latest user request and the recent live tail after this summary.
+
+## Blocked
+LLM context summary generation failed; Hermes used deterministic extractive fallback instead of a bare context-loss marker.
+
+## Key Decisions
+None inferred by fallback summarizer.
+
+## Resolved Questions
+Unknown — fallback summarizer preserves excerpts only.
+
+## Pending User Asks
+{latest_user}
+
+## Relevant Files
+{files_block}
+
+## Remaining Work
+Inspect current repository/session state as needed, then continue without relying on dropped raw turns.
+
+## Critical Context
+{critical_block}
+
+## Recent Dropped-Turn Excerpts
+{recent_block}"""))
 
     def _fallback_to_main_for_compression(self, e: Exception, reason: str) -> None:
         """Switch from a separate ``summary_model`` back to the main model.
@@ -1419,7 +1453,7 @@ The user has requested that this compaction PRIORITISE preserving all informatio
         the budget is reached. Returns the index where the tail starts.
 
         ``token_budget`` defaults to ``self.tail_token_budget`` which is
-        derived from ``summary_target_ratio * threshold_tokens``, so it
+        derived from ``summary_target_ratio * context_length``, so it
         scales automatically with the model's context window.
 
         Token budget is the primary criterion.  A hard minimum of 3 messages
@@ -1493,7 +1527,7 @@ The user has requested that this compaction PRIORITISE preserving all informatio
     # Main compression entry point
     # ------------------------------------------------------------------
 
-    def compress(self, messages: List[Dict[str, Any]], current_tokens: int = None, focus_topic: str = None, force: bool = False) -> List[Dict[str, Any]]:
+    def compress(self, messages: List[Dict[str, Any]], current_tokens: int = None, focus_topic: str = None) -> List[Dict[str, Any]]:
         """Compress conversation messages by summarizing middle turns.
 
         Algorithm:
@@ -1511,24 +1545,15 @@ The user has requested that this compaction PRIORITISE preserving all informatio
                 provided, the summariser will prioritise preserving information
                 related to this topic and be more aggressive about compressing
                 everything else.  Inspired by Claude Code's ``/compact``.
-            force: If True, clear any active summary-failure cooldown before
-                running so a manual ``/compress`` can retry immediately after
-                an auto-compression abort.  Auto-compress callers pass False.
         """
         # Reset per-call summary failure state — callers inspect these fields
         # after compress() returns to decide whether to surface a warning.
         self._last_summary_dropped_count = 0
         self._last_summary_fallback_used = False
+        self._last_compress_aborted = False
         self._last_summary_error = None
         self._last_aux_model_failure_error = None
         self._last_aux_model_failure_model = None
-        self._last_compress_aborted = False
-
-        # Manual /compress (force=True) bypasses the failure cooldown so the
-        # user can retry immediately after an auto-compress abort.  Without
-        # this, /compress would silently no-op for 30-60s after a failure.
-        if force and self._summary_failure_cooldown_until > 0.0:
-            self._summary_failure_cooldown_until = 0.0
         n_messages = len(messages)
         # Only need head + 3 tail messages minimum (token budget decides the real tail size)
         _min_for_compress = self._protect_head_size(messages) + 3 + 1
@@ -1604,32 +1629,6 @@ The user has requested that this compaction PRIORITISE preserving all informatio
         # Phase 3: Generate structured summary
         summary = self._generate_summary(turns_to_summarize, focus_topic=focus_topic)
 
-        # If summary generation failed, behavior splits on
-        # ``abort_on_summary_failure`` (config: compression.abort_on_summary_failure):
-        #   True  → ABORT compression entirely. Return messages unchanged
-        #           and set _last_compress_aborted=True so callers can warn
-        #           the user and stop the auto-compress retry loop.
-        #   False → Fall through to the legacy fallback path below: insert
-        #           a static "summary unavailable" placeholder and drop the
-        #           middle window.  Records _last_summary_fallback_used /
-        #           _last_summary_dropped_count for gateway hygiene to
-        #           surface a warning.
-        # Default is False (historical behavior).
-        if not summary and self.abort_on_summary_failure:
-            n_skipped = compress_end - compress_start
-            self._last_summary_dropped_count = 0  # nothing actually dropped
-            self._last_summary_fallback_used = False
-            self._last_compress_aborted = True
-            if not self.quiet_mode:
-                logger.warning(
-                    "Summary generation failed — aborting compression "
-                    "(compression.abort_on_summary_failure=true). "
-                    "%d message(s) preserved unchanged. Conversation is "
-                    "frozen until the next /compress or /new.",
-                    n_skipped,
-                )
-            return messages
-
         # Phase 4: Assemble compressed message list
         compressed = []
         for i in range(compress_start):
@@ -1644,8 +1643,7 @@ The user has requested that this compaction PRIORITISE preserving all informatio
                     )
             compressed.append(msg)
 
-        # Legacy fallback path: LLM summary failed and abort_on_summary_failure
-        # is False (the default).  Insert a static placeholder so the model
+        # If LLM summary failed, insert a static fallback so the model
         # knows context was lost rather than silently dropping everything.
         if not summary:
             if not self.quiet_mode:
@@ -1653,12 +1651,11 @@ The user has requested that this compaction PRIORITISE preserving all informatio
             n_dropped = compress_end - compress_start
             self._last_summary_dropped_count = n_dropped
             self._last_summary_fallback_used = True
-            summary = (
-                f"{SUMMARY_PREFIX}\n"
-                f"Summary generation was unavailable. {n_dropped} message(s) were "
-                f"removed to free context space but could not be summarized. The removed "
-                f"messages contained earlier work in this session. Continue based on the "
-                f"recent messages below and the current state of any files or resources."
+            err_text = getattr(self, "_last_summary_error", None) or "unknown error"
+            summary = self._build_extractive_fallback_summary(
+                turns_to_summarize,
+                dropped_count=n_dropped,
+                error_text=err_text,
             )
 
         _merge_summary_into_tail = False
@@ -1717,13 +1714,6 @@ The user has requested that this compaction PRIORITISE preserving all informatio
         self.compression_count += 1
 
         compressed = self._sanitize_tool_pairs(compressed)
-
-        # Replace image parts in all compressed messages before the newest
-        # image-bearing user turn with a short text placeholder. Without
-        # this, tail messages keep their original multi-MB base-64 image
-        # payloads forever, which can push every subsequent API request
-        # past the provider's body-size limit and wedge the session.
-        # Port of Kilo-Org/kilocode#9434.
         compressed = _strip_historical_media(compressed)
 
         new_estimate = estimate_messages_tokens_rough(compressed)

@@ -184,6 +184,31 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
             )
 
 
+def _extract_delegate_summary(raw: Any) -> str:
+    """Extract a user-facing summary from delegate_task JSON/text output."""
+    if raw is None:
+        return ""
+    text = raw if isinstance(raw, str) else str(raw)
+    try:
+        payload = json.loads(text)
+    except Exception:
+        return text
+    if isinstance(payload, dict):
+        results = payload.get("results")
+        if isinstance(results, list) and results:
+            first = results[0]
+            if isinstance(first, dict):
+                for key in ("summary", "final_response", "output", "result"):
+                    value = first.get(key)
+                    if isinstance(value, str) and value.strip():
+                        return value
+        for key in ("summary", "final_response", "output", "result"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value
+    return text
+
+
 def run_conversation(
     agent,
     user_message: str,
@@ -533,6 +558,69 @@ def run_conversation(
     truncated_response_parts: List[str] = []
     compression_attempts = 0
     _turn_exit_reason = "unknown"  # Diagnostic: why the loop ended
+
+    # ── Proactive context rollover ──
+    # When enabled and the previous turn's prompt usage is already high, skip
+    # another parent-model API call for substantial follow-up work and dispatch
+    # directly to a fresh delegate_task child. This preserves context quality and
+    # avoids burning a near-full parent session on orchestration text.
+    try:
+        from agent.context_rollover import build_usage_snapshot, maybe_build_rollover_handoff
+
+        _rollover_cfg = getattr(agent, "context_rollover_config", None)
+        _last_prompt_tokens = int(getattr(agent.context_compressor, "last_prompt_tokens", 0) or 0)
+        _context_length = int(getattr(agent.context_compressor, "context_length", 0) or 0)
+        if _rollover_cfg and _last_prompt_tokens > 0 and _context_length > 0:
+            _rollover_snapshot = build_usage_snapshot(
+                prompt_tokens=_last_prompt_tokens,
+                context_length=_context_length,
+                source="last_prompt_tokens",
+            )
+            _rollover_handoff = maybe_build_rollover_handoff(
+                config=_rollover_cfg,
+                snapshot=_rollover_snapshot,
+                messages=messages,
+                user_message=original_user_message if isinstance(original_user_message, str) else user_message,
+                cwd=os.getcwd(),
+                valid_tool_names=getattr(agent, "valid_tool_names", set()),
+            )
+            if _rollover_handoff:
+                delegate_result_raw = agent._dispatch_delegate_task({
+                    "goal": original_user_message if isinstance(original_user_message, str) else user_message,
+                    "context": _rollover_handoff,
+                })
+                final_response = _extract_delegate_summary(delegate_result_raw)
+                _turn_exit_reason = "context_rollover_delegate"
+                messages.append({"role": "assistant", "content": final_response})
+                agent._persist_session(messages, conversation_history)
+                return {
+                    "final_response": final_response,
+                    "last_reasoning": None,
+                    "messages": messages,
+                    "api_calls": 0,
+                    "completed": True,
+                    "turn_exit_reason": _turn_exit_reason,
+                    "partial": False,
+                    "interrupted": False,
+                    "response_previewed": getattr(agent, "_response_was_previewed", False),
+                    "model": agent.model,
+                    "provider": agent.provider,
+                    "base_url": agent.base_url,
+                    "input_tokens": agent.session_input_tokens,
+                    "output_tokens": agent.session_output_tokens,
+                    "cache_read_tokens": agent.session_cache_read_tokens,
+                    "cache_write_tokens": agent.session_cache_write_tokens,
+                    "reasoning_tokens": agent.session_reasoning_tokens,
+                    "prompt_tokens": agent.session_prompt_tokens,
+                    "completion_tokens": agent.session_completion_tokens,
+                    "total_tokens": agent.session_total_tokens,
+                    "last_prompt_tokens": _last_prompt_tokens,
+                    "estimated_cost_usd": agent.session_estimated_cost_usd,
+                    "cost_status": agent.session_cost_status,
+                    "cost_source": agent.session_cost_source,
+                }
+    except Exception as exc:
+        logger.warning("context rollover handoff failed; continuing in parent session: %s", exc)
 
     # Per-turn file-mutation verifier state.  Keyed by resolved path;
     # each failed ``write_file`` / ``patch`` call records the error
