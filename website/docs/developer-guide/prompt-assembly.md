@@ -27,7 +27,16 @@ Primary files:
 
 ## Cached system prompt layers
 
-`build_system_prompt_parts()` in `agent/system_prompt.py` returns a `{"stable": ..., "context": ..., "volatile": ...}` dict, joined with `\n\n`. The three tiers exist on purpose — only the **stable** and **context** tiers survive unchanged across turns and contribute to upstream prefix-cache hits. The **volatile** tier is rebuilt every time the system prompt is regenerated (memory writes, USER.md edits, or compression-driven rebuilds invalidate it).
+`build_system_prompt_parts()` in `agent/system_prompt.py` returns a `{"stable": ..., "context": ..., "volatile": ...}` dict; `build_system_prompt()` then joins all three with `\n\n` into a single string. Callers (primarily `run_agent.py`) store that joined string on `agent._cached_system_prompt` so the same prompt is reused across every turn in the session — `build_system_prompt()` itself is pure and does not touch the cache. The three tiers are an *ordering* discipline, not a per-call rebuild boundary: **stable** and **context** form the most cache-friendly prefix, and **volatile** is placed *last* so that when the cached prompt is eventually invalidated and rebuilt, the churn is confined to the suffix and the upstream prefix-cache hit on the stable + context region is preserved across rebuilds. The whole assembled string still hashes to a new value when volatile changes, so a full system-prompt cache miss is unavoidable on each rebuild — placing volatile last only minimizes *prefix* churn, not full-prompt churn.
+
+The cached prompt is rebuilt only when something explicitly clears `agent._cached_system_prompt`. The known triggers are:
+
+- `invalidate_system_prompt()` after context compression — `agent/conversation_compression.py`'s `compress_context()` calls it, then immediately re-assigns the freshly-built prompt
+- Mid-session model swap — direct assignment in `agent/agent_runtime_helpers.py`
+- CLI session lifecycle events — `/new`, `/resume`, and `/fork` paths in `cli.py` call `_invalidate_system_prompt()`
+- TUI gateway `/prompt` config swap — `tui_gateway/server.py` directly nulls `_cached_system_prompt` when `agent.ephemeral_system_prompt` is reassigned
+
+Mid-session writes to `MEMORY.md` / `USER.md` update disk state but do **not** by themselves invalidate the cached prompt — the new snapshot is only re-read on the next invalidation event (`invalidate_system_prompt()` calls `memory_store.load_from_disk()` before the rebuild).
 
 ### Stable tier (identity + guidance — cached across turns)
 
@@ -47,14 +56,14 @@ Primary files:
 11. Optional caller-supplied `system_message`
 12. Context files (`.hermes.md`, `AGENTS.md`, `CLAUDE.md`, `.cursorrules`, `.cursor/rules/*.mdc`) discovered under `TERMINAL_CWD` via `build_context_files_prompt()` — `SOUL.md` is excluded here when `_soul_loaded=True` (passed in as `skip_soul=_soul_loaded`) to prevent double injection
 
-### Volatile tier (rebuilt every render — never cached safely)
+### Volatile tier (rebuilt on prompt regeneration — placed last to minimize prefix-cache churn)
 
-13. **MEMORY snapshot** — `agent._memory_store.format_for_system_prompt("memory")`. Mid-session writes to `MEMORY.md` update disk state but the **already-built** system prompt keeps the old snapshot until `invalidate_system_prompt()` triggers a rebuild (called by compression).
+13. **MEMORY snapshot** — `agent._memory_store.format_for_system_prompt("memory")`. Mid-session writes to `MEMORY.md` update disk state but the **already-built** system prompt keeps the old snapshot until `invalidate_system_prompt()` triggers a rebuild (called by compression, mid-session model swap, or CLI session lifecycle events — see the trigger list above).
 14. **USER profile snapshot** — `agent._memory_store.format_for_system_prompt("user")`. Same lifecycle as the MEMORY snapshot.
 15. External memory provider block — `agent._memory_manager.build_system_prompt()` when a plugin provider is attached.
 16. Timestamp + optional session ID + model + provider line. Date-only granularity (not minute-precision) to keep the prompt byte-stable for the day.
 
-> Note: memory and USER profile sit in the **volatile** tier even though they only change once per session in practice — they are still excluded from the cache-friendly prefix so memory tool writes do not poison stale prompt caches. If you rely on prompt caching benchmarks, treat the entire volatile tier as the cache-invalidation boundary.
+> Note: memory and USER profile sit in the **volatile** tier even though they only change once per session in practice — placing them at the *end* of the assembled prompt keeps the **stable** and **context** prefix byte-identical across turns even when the volatile suffix later rebuilds, which is what makes the upstream prefix-cache continue to hit on the leading region. The whole assembled prompt — stable + context + volatile — is still cached as one string on `agent._cached_system_prompt`; on a rebuild the cache key for the *full* prompt changes, but the leading stable + context bytes are unchanged so prefix-aware caches still benefit. Regeneration runs only when `_cached_system_prompt` is explicitly invalidated (compression, model swap, or one of the CLI / TUI lifecycle events listed above).
 
 ### SOUL.md load condition
 
@@ -131,7 +140,7 @@ This is the atlas project. Use pytest for testing. The main
 entry point is src/atlas/main.py. Always run `make lint` before
 committing.
 
-# ── Volatile tier (rebuilt every render — never cache-stable) ─────
+# ── Volatile tier (rebuilt on prompt regeneration — placed last to minimize prefix-cache churn) ─────
 
 # [volatile] MEMORY snapshot
 ## Persistent Memory
